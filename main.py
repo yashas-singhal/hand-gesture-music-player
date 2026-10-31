@@ -1,208 +1,264 @@
 
 from pathlib import Path
+import time
+
 import cv2
 import mediapipe as mp
-import time
 import pygame
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
-# -----------------------------
-# 1. File paths
-# -----------------------------
+# File paths
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = str(BASE_DIR / "hand_landmarker.task")
+MODEL_PATH = BASE_DIR / "hand_landmarker.task"
 SOUNDS_DIR = BASE_DIR / "sounds_swaras"
 
-# -----------------------------
-# 2. MediaPipe setup
-# -----------------------------
-mp_vision = mp.tasks.vision
-
-base_options = mp.tasks.BaseOptions(
-    model_asset_path=MODEL_PATH
-)
-
-options = mp_vision.HandLandmarkerOptions(
-    base_options=base_options,
-    running_mode=mp_vision.RunningMode.VIDEO,
-    num_hands=2
-)
-
-landmarker = mp_vision.HandLandmarker.create_from_options(options)
-
-pygame.mixer.init()
-
-# Hand connections for drawing
+# Connections between the 21 hand landmarks
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
     (5, 9), (9, 10), (10, 11), (11, 12),
     (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17)
+    (13, 17), (17, 18), (18, 19), (19, 20)
 ]
 
-# -----------------------------
-# 3. Webcam setup
-# -----------------------------
-cap = cv2.VideoCapture(0)
-
-if not cap.isOpened():
-    landmarker.close()
-    raise RuntimeError("Cannot open webcam")
-
-start_time = time.monotonic()
-last_timestamp_ms = -1
-
-sounds_mapping = {
-    1: SOUNDS_DIR / "1_Sa.mp3",
-    2: SOUNDS_DIR / "2_Re.mp3",
-    3: SOUNDS_DIR / "3_Ga.mp3",
-    4: SOUNDS_DIR / "4_Ma.mp3",
-    5: SOUNDS_DIR / "5_Pa.mp3",
-    6: SOUNDS_DIR / "6_Dha.mp3",
-    7: SOUNDS_DIR / "7_Ni.mp3",
-    8: SOUNDS_DIR / "8_Sa_upper.mp3"
+# Finger count to audio file mapping
+SOUND_FILES = {
+    1: "1_Sa.mp3",
+    2: "2_Re.mp3",
+    3: "3_Ga.mp3",
+    4: "4_Ma.mp3",
+    5: "5_Pa.mp3",
+    6: "6_Dha.mp3",
+    7: "7_Ni.mp3",
+    8: "8_Sa_upper.mp3"
 }
 
-previous_count = -1
+SWARA_NAMES = {
+    1: "Sa",
+    2: "Re",
+    3: "Ga",
+    4: "Ma",
+    5: "Pa",
+    6: "Dha",
+    7: "Ni",
+    8: "Sa (Upper)"
+}
 
-# -----------------------------
-# 4. Main webcam loop
-# -----------------------------
-try:
-    while True:
-        ret, frame = cap.read()
 
-        if not ret:
-            break
+# Draw hand skeleton
+def draw_landmarks(frame, hand_landmarks):
+    h, w, _ = frame.shape
 
-        # Mirror webcam
-        frame = cv2.flip(frame, 1)
+    points = [
+        (int(lm.x * w), int(lm.y * h))
+        for lm in hand_landmarks
+    ]
 
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Create MediaPipe image
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=rgb_frame
+    # Draw green connecting lines
+    for start, end in HAND_CONNECTIONS:
+        cv2.line(
+            frame, points[start], points[end],
+            (0, 255, 0), 2
         )
 
-        # Generate timestamp
-        timestamp_ms = max(
-            int((time.monotonic() - start_time) * 1000),
-            last_timestamp_ms + 1
+    # Draw red landmark dots
+    for point in points:
+        cv2.circle(frame, point, 4, (0, 0, 255), -1)
+
+
+# Count raised fingers of one hand
+def count_hand_fingers(hand_landmarks, label):
+    count = 0
+
+    # Thumb: compare horizontal coordinates
+    if label == "Right":
+        if hand_landmarks[4].x < hand_landmarks[3].x:
+            count += 1
+
+    elif label == "Left":
+        if hand_landmarks[4].x > hand_landmarks[3].x:
+            count += 1
+
+    # Index, middle, ring and pinky
+    finger_pairs = [
+        (8, 6),
+        (12, 10),
+        (16, 14),
+        (20, 18)
+    ]
+
+    for tip, pip in finger_pairs:
+        if hand_landmarks[tip].y < hand_landmarks[pip].y:
+            count += 1
+
+    return count
+
+
+def main():
+
+    # Verify model file
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Model file not found: {MODEL_PATH}"
         )
-        last_timestamp_ms = timestamp_ms
 
-        # Detect hands
-        result = landmarker.detect_for_video(
-            mp_image,
-            timestamp_ms
+    # Create sound mapping
+    sounds_mapping = {
+        count: str(SOUNDS_DIR / filename)
+        for count, filename in SOUND_FILES.items()
+    }
+
+    # Verify sound files
+    for count, path in sounds_mapping.items():
+        if not Path(path).is_file():
+            raise FileNotFoundError(
+                f"Sound file missing for {count} fingers: {path}"
+            )
+
+    # Initialize Pygame
+    pygame.mixer.init()
+
+    # Create MediaPipe HandLandmarker
+    base_options = mp_python.BaseOptions(
+        model_asset_path=str(MODEL_PATH)
+    )
+
+    options = mp_vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_hands=2
+    )
+
+    landmarker = None
+    cap = None
+
+    try:
+        landmarker = mp_vision.HandLandmarker.create_from_options(
+            options
         )
 
-        # Reset finger count for each frame
-        total_fingers = 0
+        # Open webcam
+        cap = cv2.VideoCapture(0)
 
-        height, width, _ = frame.shape
+        if not cap.isOpened():
+            raise RuntimeError("Cannot open webcam")
 
-        # Process each detected hand
-        for hand_landmarks in result.hand_landmarks:
+        start_time = time.time()
+        last_timestamp_ms = -1
+        previous_count = None
 
-            # Draw hand connections
-            for start_idx, end_idx in HAND_CONNECTIONS:
-                start = hand_landmarks[start_idx]
-                end = hand_landmarks[end_idx]
+        while True:
 
-                start_point = (
-                    int(start.x * width),
-                    int(start.y * height)
+            # Read frame
+            success, frame = cap.read()
+
+            if not success:
+                break
+
+            # Mirror frame
+            frame = cv2.flip(frame, 1)
+
+            # Convert BGR to RGB
+            rgb_frame = cv2.cvtColor(
+                frame, cv2.COLOR_BGR2RGB
+            )
+
+            # Convert to MediaPipe image
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb_frame
+            )
+
+            # Timestamp in milliseconds
+            timestamp_ms = max(
+                last_timestamp_ms + 1,
+                int((time.time() - start_time) * 1000)
+            )
+            last_timestamp_ms = timestamp_ms
+
+            # Detect hands
+            result = landmarker.detect_for_video(
+                mp_image, timestamp_ms
+            )
+
+            # Reset finger count every frame
+            count = 0
+
+            # Process each detected hand
+            for i, hand_landmarks in enumerate(
+                result.hand_landmarks
+            ):
+
+                label = result.handedness[i][0].category_name
+
+                count += count_hand_fingers(
+                    hand_landmarks, label
                 )
-                end_point = (
-                    int(end.x * width),
-                    int(end.y * height)
-                )
 
-                cv2.line(
-                    frame,
-                    start_point,
-                    end_point,
-                    (0, 255, 0),
-                    2
-                )
+                draw_landmarks(frame, hand_landmarks)
 
-            # Draw all 21 landmarks
-            for landmark in hand_landmarks:
-                x = int(landmark.x * width)
-                y = int(landmark.y * height)
+            # Play sound only when finger count changes
+            if count != previous_count:
 
-                cv2.circle(
-                    frame,
-                    (x, y),
-                    5,
-                    (0, 0, 255),
-                    -1
-                )
-
-            # Count non-thumb fingers
-            finger_pairs = [
-                (8, 6),    # Index
-                (12, 10),  # Middle
-                (16, 14),  # Ring
-                (20, 18)   # Pinky
-            ]
-
-            for tip, pip in finger_pairs:
-                if hand_landmarks[tip].y < hand_landmarks[pip].y:
-                    total_fingers += 1
-
-        # Display finger count
-        cv2.putText(
-            frame,
-            f"Fingers: {total_fingers}",
-            (30, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.5,
-            (0, 255, 0),
-            3
-        )
-
-        # Display number of detected hands
-        cv2.putText(
-            frame,
-            f"Hands: {len(result.hand_landmarks)}",
-            (30, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (255, 255, 0),
-            2
-        )
-
-        # Play sound only when the finger count changes
-        if total_fingers != previous_count:
-
-            if total_fingers == 0:
-                pygame.mixer.music.stop()
-
-            elif total_fingers in sounds_mapping:
-                sound_path = sounds_mapping[total_fingers]
-
-                if sound_path.is_file():
-                    pygame.mixer.music.load(str(sound_path))
+                if count in sounds_mapping:
+                    pygame.mixer.music.load(
+                        sounds_mapping[count]
+                    )
                     pygame.mixer.music.play()
+
                 else:
-                    print(f"Sound file missing: {sound_path}")
+                    # Silence for 0, 9 and 10 fingers
+                    pygame.mixer.music.stop()
 
-        previous_count = total_fingers
+                previous_count = count
 
-        # Display webcam
-        cv2.imshow("Gesture Music Player", frame)
+            # Display finger count
+            cv2.putText(
+                frame,
+                f"Fingers: {count}",
+                (20, 45),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 255, 255),
+                2
+            )
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            # Display swara name
+            swara = SWARA_NAMES.get(count, "Silence")
 
-finally:
-    cap.release()
-    landmarker.close()
-    pygame.mixer.quit()
-    cv2.destroyAllWindows()
+            cv2.putText(
+                frame,
+                f"Swara: {swara}",
+                (20, 85),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2
+            )
+
+            # Show webcam frame
+            cv2.imshow(
+                "Hand Gesture Swara Player",
+                frame
+            )
+
+            # Quit on pressing q
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    finally:
+        # Release resources
+        if cap is not None:
+            cap.release()
+
+        cv2.destroyAllWindows()
+
+        if landmarker is not None:
+            landmarker.close()
+
+        pygame.mixer.quit()
+
+
+if __name__ == "__main__":
+    main()
